@@ -41,15 +41,15 @@ from tqdm import tqdm
 # =========================
 import vbjax as vb
 from vbjax import make_sdde
-import lib.gast_model as gm
-from lib.inference import Inference
+import src.gast_model as gm
+from src.inference import Inference
 from vbt_trial.analysis.analyse_simulation import (
     compute_fcd,
     find_ALFF_of_roi,
 )
 
 # Import analysis functions for backward compatibility
-from lib.analysis import (
+from src.analysis import (
     get_bold_feature_labels,
     extract_bold_features,
     compute_fcd_jax,
