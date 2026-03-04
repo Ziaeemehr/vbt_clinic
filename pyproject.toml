@@ -8,7 +8,27 @@ version = "0.1.0"
 description = "A minimal Python package"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.17.0",
+    "pandas>=2.0",
+    "matplotlib>=3.0",
+    "seaborn>=0.13.0",
+    "jax>=0.4.28",
+    "jaxlib>=0.4.28",
+    "jax-cuda12-plugin>=0.4.28",
+    "jax-cuda12-pjrt>=0.4.28",
+    "torch>=2.0",
+    "pymc>=5.0",
+    "arviz>=0.23.0",
+    "sbi>=0.25.0",
+    "scikit-learn>=1.0",
+    "h5py>=3.0",
+    "xarray>=2025.0",
+    "nibabel>=5.0",
+    "nilearn>=0.13.0",
+    "tqdm>=4.60"
+]
 
 [project.optional-dependencies]
 dev = [
@@ -16,3 +36,6 @@ dev = [
     "black",
     "flake8",
 ]
+
+[tool.setuptools]
+packages = ["src"]

@@ -458,7 +458,7 @@ def analyze_graph_from_mask(mask, name="Graph"):
         print(f"Density: {density:.4f}")
         print(f"{'='*50}\n")
 
-def load_simulation_data(data_dir="data", verbose=False):
+def load_connectivity_data(data_dir="data", verbose=False):
     """
     Load and process simulation data from CSV files.
 
@@ -479,13 +479,14 @@ def load_simulation_data(data_dir="data", verbose=False):
     Ci_mask = pd.read_csv(os.path.join(data_dir, "dk_sero_inh_mask.csv"), index_col=0)
     Cd_mask = pd.read_csv(os.path.join(data_dir, "dk_sero_dopa_mask.csv"), index_col=0)
     Cs_mask = pd.read_csv(os.path.join(data_dir, "dk_sero_sero_mask.csv"), index_col=0)
-    Ce = W.values * Ce_mask.values
-    Ci = W.values * Ci_mask.values
-    Cd = W.values * Cd_mask.values
-    Cs = W.values * Cs_mask.values
+    # Ce = W.values * Ce_mask.values
+    # Ci = W.values * Ci_mask.values
+    # Cd = W.values * Cd_mask.values
+    # Cs = W.values * Cs_mask.values
     region_names = W.index.tolist()
 
-    Ceids = np.vstack([Ce, Ci, Cd, Cs])
+    # Ceids = np.vstack([Ce, Ci, Cd, Cs])
+    Ceids = np.load(join(data_dir,'Ceids.npy'))
     Leids = np.vstack([L, L, L, L])
     Seids = scipy.sparse.csr_matrix(Ceids)
     
@@ -495,16 +496,17 @@ def load_simulation_data(data_dir="data", verbose=False):
         analyze_graph_from_mask(Ci_mask.values, name="Inhibitory Connection Graph")
         analyze_graph_from_mask(Cd_mask.values, name="Dopamine Connection Graph")
 
-    Rdf = pd.read_csv(os.path.join(data_dir, "dk_D1_D2_5HT2A_receptor_data.csv"))
-    Rd1 = Rdf["D1_number"].values
-    Rd2 = Rdf["D2_number"].values
-    Rsero = Rdf["5HT2A_number"].values
-    Rd2 = 1.5 * Rd2 / (5 * Rd2.max())
-    Rd1 = 1.5 * Rd1 / (5 * Rd1.max())
-    Rsero = 1.5 * Rsero / (5 * Rsero.max())
-    Rd1 = Rd1.reshape(-1, 1)
-    Rd2 = Rd2.reshape(-1, 1)
-    Rsero = Rsero.reshape(-1, 1)
+    # Rdf = pd.read_csv(os.path.join(data_dir, "dk_D1_D2_5HT2A_receptor_data.csv"))
+    # Rd1 = Rdf["D1_number"].values
+    # Rd2 = Rdf["D2_number"].values
+    # Rsero = Rdf["5HT2A_number"].values
+    # Rd2 = 1.5 * Rd2 / (5 * Rd2.max())
+    # Rd1 = 1.5 * Rd1 / (5 * Rd1.max())
+    # Rsero = 1.5 * Rsero / (5 * Rsero.max())
+    # Rd1 = Rd1.reshape(-1, 1)
+    # Rd2 = Rd2.reshape(-1, 1)
+    # Rsero = Rsero.reshape(-1, 1)
+    Rd1, Rd2, Rsero = np.load(join(data_dir, 'Receptors.npy'))
 
     return Ceids, Leids, Seids, Rd1, Rd2, Rsero, region_names
 

@@ -1,5 +1,9 @@
 "Jax impl of simulation in fused.ispc.c."
 
+import os
+# Enable XLA deterministic operations for reproducibility on GPU
+os.environ.setdefault('XLA_FLAGS', '--xla_gpu_deterministic_ops=true')
+
 import jax
 import jax.numpy as jnp
 import vbjax as vb
@@ -8,6 +12,7 @@ import numpy as np
 from . import gast_model as gm
 from tqdm import tqdm
 from copy import deepcopy
+from jax.ops import segment_sum
 import pickle
 
 
@@ -17,7 +22,7 @@ def make_jp_runsim(
     params: np.ndarray,
     horizon: int,
     rng_seed=43,
-    num_item=8,
+    num_item=1,
     num_svar=10,
     num_time=1000,
     t_cut=0.0,
@@ -77,13 +82,14 @@ def make_jp_runsim(
         [i * np.ones(n, "i") for i, n in enumerate(np.diff(csr_weights.indptr))]
     )
     j_csr_rows = jnp.array(_csr_rows)
-
+        
     def cfun(buffer, t):
         wxij = j_weights.reshape(-1, 1) * buffer[j_indices, (t - idelays2) & horizonm1]
         cx = jnp.zeros((2, num_out_node, num_item))
         cx = cx.at[:, j_csr_rows].add(wxij)
         return cx
-
+    
+    
     def dfun(x, cx):
         # cx.shape = (3*num_node, num_node, ...)
         Ce_aff, Ci_aff, Cd_aff, Cs_aff = cx.reshape(4, num_node, num_item)
@@ -304,7 +310,7 @@ def check_input_parameters(theta, num_item, num_nodes):
                 )
 
     # Vector parameters: should be (num_nodes, 1) or (num_nodes, num_item)
-    vector_params = ["Jdopa", "Rd1", "Rd2", "Rs"]
+    vector_params = ["Jdopa", "Rd1", "Rd2", "Rs", "Ja", "Jsa"]
 
     for param_name in vector_params:
         if hasattr(theta, param_name):
@@ -422,7 +428,7 @@ def run_sweep(
         print(f"Running simulation with {noise_mode} noise across {num_item} parameter sets...")
     
     bolds, ts = run_sim_jp(master_key, setup["init_state"])
-    _ = bolds.block_until_ready()
+    bolds.block_until_ready()
     
     if verbose:
         print(f"Simulation complete. BOLD shape: {bolds.shape}, Time points: {ts.shape}")
