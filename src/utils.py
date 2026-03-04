@@ -43,10 +43,10 @@ import vbjax as vb
 from vbjax import make_sdde
 import src.gast_model as gm
 from src.inference import Inference
-from vbt_trial.analysis.analyse_simulation import (
-    compute_fcd,
-    find_ALFF_of_roi,
-)
+# from vbt_trial.analysis.analyse_simulation import (
+#     compute_fcd,
+#     find_ALFF_of_roi,
+# )
 
 # Import analysis functions for backward compatibility
 from src.analysis import (
