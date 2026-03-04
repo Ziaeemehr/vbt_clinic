@@ -43,3 +43,13 @@ htmlcov/
 
 # macOS
 .DS_Store
+
+*.png 
+*.jpg
+*.jpeg
+*.gif
+
+e/
+_e/
+e.py 
+*.npz
