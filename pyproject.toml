@@ -27,7 +27,8 @@ dependencies = [
     "xarray>=2025.0",
     "nibabel>=5.0",
     "nilearn>=0.13.0",
-    "tqdm>=4.60"
+    "tqdm>=4.60",
+    "vbjax"
 ]
 
 [project.optional-dependencies]
