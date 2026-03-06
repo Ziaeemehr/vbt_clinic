@@ -16,6 +16,241 @@ from jax.ops import segment_sum
 import pickle
 
 
+def _make_jp_runsim(
+    csr_weights: scipy.sparse.csr_matrix,
+    idelays: np.ndarray,
+    params: np.ndarray,
+    horizon: int,
+    rng_seed=43,
+    num_svar=10,
+    num_time=1000,
+    t_cut=0.0,
+    dt=0.1,
+    num_skip=5,
+    adhoc=None,
+    bold_decimate=10,
+):
+    """
+    Optimized version of make_jp_runsim for num_item=1 (single simulation).
+    
+    This version removes the batch dimension entirely for cleaner code and potentially
+    better performance. All arrays are 2D (num_svar, num_node) instead of 3D.
+    
+    Args:
+        csr_weights: Sparse connectivity matrix (CSR format)
+        idelays: Delay matrix for connections
+        params: Model parameters (NamedTuple)
+        horizon: Size of circular buffer for delays
+        rng_seed: Random seed (not used, kept for compatibility)
+        num_svar: Number of state variables
+        num_time: Total integration steps
+        t_cut: Time to cut from beginning to remove transient (in ms)
+        dt: Integration timestep
+        num_skip: Steps between BOLD updates
+        adhoc: Constraint function applied after integration
+        bold_decimate: Factor to decimate BOLD samples
+        
+    Returns:
+        jit-compiled simulation function for single simulation
+    """
+    
+    # Squeeze parameters from (num_node, 1) to (num_node,) for single simulation
+    # This is necessary because the batched version uses (num_node, 1) for broadcasting
+    # with (num_node, num_item), but single simulation uses (num_node,)
+    params_squeezed = type(params)(**{
+        field: jnp.squeeze(jnp.asarray(getattr(params, field))) 
+        if hasattr(getattr(params, field), 'shape') and len(jnp.asarray(getattr(params, field)).shape) == 2
+        else getattr(params, field)
+        for field in params._fields
+    })
+    
+    num_out_node, num_node = csr_weights.shape
+    horizonm1 = horizon - 1
+    j_indices = jnp.array(csr_weights.indices)
+    j_weights = jnp.array(csr_weights.data)
+    j_indptr = jnp.array(csr_weights.indptr)
+    assert idelays.max() < horizon - 2
+    idelays2 = jnp.array(horizon + np.c_[idelays, idelays - 1].T)
+    idelays2 = idelays2.astype(jnp.int32)
+    j_indices = j_indices.astype(jnp.int32)
+    
+    _csr_rows = np.concatenate(
+        [i * np.ones(n, "i") for i, n in enumerate(np.diff(csr_weights.indptr))]
+    )
+    assert np.all(_csr_rows[:-1] <= _csr_rows[1:]), "CSR row indices must be sorted for segment_sum"
+    j_csr_rows = jnp.array(_csr_rows)
+    
+    def cfun(buffer, t):
+        """
+        Compute coupling for single simulation (no batch dimension).
+        buffer shape: (num_node, horizon)
+        returns: (2, num_out_node) where num_out_node = 4 * num_node (stacked E, I, D, S)
+        
+        Uses the same scatter-add approach as make_jp_runsim for consistency.
+        """
+        # Get delayed buffer values
+        # buffer[j_indices, (t - idelays2) & horizonm1] has shape (2, num_edges)
+        # because idelays2 has shape (2, num_edges) and broadcasting creates 2 in first dim
+        delayed_values = buffer[j_indices, (t - idelays2) & horizonm1]  # shape: (2, num_edges)
+        
+        # Multiply: j_weights shape (num_edges,) * delayed_values shape (2, num_edges)
+        # Need to broadcast j_weights to shape (1, num_edges) so result is (2, num_edges)
+        wxij = j_weights.reshape(1, -1) * delayed_values  # shape: (2, num_edges)
+        
+        # Use scatter-add (same as make_jp_runsim but without batch dimension)
+        cx = jnp.zeros((2, num_out_node))
+        cx = cx.at[:, j_csr_rows].add(wxij)
+        return cx
+    
+    def dfun(x, cx):
+        """
+        Dynamics function for single simulation.
+        x shape: (num_svar, num_node)
+        cx shape: (num_out_node,) = (4*num_node,) - single delay component
+        returns: (num_svar, num_node)
+        """
+        # cx has 4*num_node entries: [E_connections, I_connections, D_connections, S_connections]
+        # For single simulation, we don't have a batch dimension
+        Ce_aff, Ci_aff, Cd_aff, Cs_aff = cx.reshape(4, num_node)
+        return gm.sigm_d1d2sero_dfun(
+            x,
+            (
+                params_squeezed.we * Ce_aff,
+                params_squeezed.wi * Ci_aff,
+                params_squeezed.wd * Cd_aff,
+                params_squeezed.ws * Cs_aff,
+            ),
+            params_squeezed,
+        )
+    
+    def heun(x, cx, step_counter, master_key):
+        """
+        Heun integration for single simulation.
+        x shape: (num_svar, num_node)
+        cx shape: (2, num_node)
+        returns: (num_svar, num_node)
+        """
+        step_key = jax.random.fold_in(master_key, step_counter)
+        
+        z = jnp.zeros((num_svar, num_node))
+        
+        # Generate noise - shape: (2, num_node)
+        noise = jax.random.normal(step_key, (2, num_node))
+        
+        z = z.at[1:3].set(noise)
+        z = z.at[1].multiply(params_squeezed.sigma_V)
+        z = z.at[2].multiply(params_squeezed.sigma_u)
+        
+        dx1 = dfun(x, cx[0])
+        dx2 = dfun(x + dt * dx1 + z, cx[1])
+        x_new = x + dt / 2 * (dx1 + dx2) + z
+        
+        if adhoc is not None:
+            x_new = adhoc(x_new, params_squeezed)
+        
+        return x_new
+    
+    # BOLD monitor - shape: (num_node,) for single simulation
+    dt_bold = dt * num_skip / 1000.0
+    bold_buf0, bold_step, bold_samp = vb.make_bold(
+        shape=(num_node,),  # No batch dimension
+        dt=dt_bold,
+        p=vb.bold_default_theta,
+    )
+    
+    def step_and_update_bold(state, time_idx):
+        """
+        Inner loop for single simulation.
+        All state arrays have no batch dimension.
+        """
+        buffer = state["buf"]
+        bold_buf = state["bold"]
+        neural_state = state["x"]
+        step_counter = state["k"]
+        master_key = state["master_key"]
+        
+        assert neural_state.shape == (num_svar, num_node)
+        
+        for step_i in range(num_skip):
+            abs_time = step_i + time_idx * num_skip
+            coupling = cfun(buffer, abs_time)
+            
+            neural_state = heun(neural_state, coupling, step_counter, master_key)
+            
+            # Store firing rate - shape: (num_node,)
+            buffer = buffer.at[:, abs_time % horizon].set(neural_state[0])
+            
+            step_counter = step_counter + 1
+        
+        # Update BOLD buffer
+        bold_buf = bold_step(bold_buf, neural_state[0])
+        
+        state["x"] = neural_state
+        state["buf"] = buffer
+        state["bold"] = bold_buf
+        state["k"] = step_counter
+        return state, None
+    
+    def step_and_sample_bold(state, decim_idx):
+        """Outer loop with BOLD decimation."""
+        start_idx = decim_idx * bold_decimate
+        
+        def inner_loop_body(iter_i, state_carry):
+            state_carry, _ = step_and_update_bold(state_carry, start_idx + iter_i)
+            return state_carry
+        
+        state = jax.lax.fori_loop(0, bold_decimate, inner_loop_body, state)
+        
+        bold_buf, bold_signal = bold_samp(state["bold"])
+        state["bold"] = bold_buf
+        
+        return state, bold_signal
+    
+    def run_sim_jp(master_key, init_state):
+        """
+        Run single simulation.
+        
+        Args:
+            master_key: JAX PRNG key
+            init_state: Initial state array, shape (num_svar,) or (num_svar, 1)
+        
+        Returns:
+            bold: BOLD signal, shape (num_time_points, num_node)
+            ts: Time array, shape (num_time_points,)
+        """
+        # Buffer shape: (num_node, horizon) - no batch dimension
+        buffer = jnp.zeros((num_node, horizon)) + init_state[0]
+        
+        # Ensure init_state is flattened properly
+        init_state_flat = init_state.flatten() if init_state.ndim > 1 else init_state
+        
+        init = {
+            "buf": buffer,
+            "bold": bold_buf0,
+            "x": jnp.zeros((num_svar, num_node)) + init_state_flat.reshape(-1, 1),
+            "k": 0,
+            "master_key": master_key,
+        }
+        
+        num_bold_samples = num_time // num_skip
+        num_decimated_samples = num_bold_samples // bold_decimate
+        decimated_indices = jnp.r_[:num_decimated_samples]
+        
+        _, bold = jax.lax.scan(step_and_sample_bold, init, decimated_indices)
+        
+        if t_cut > 0:
+            dt_bold_sample = dt * num_skip * bold_decimate
+            cut_idx = int(t_cut / dt_bold_sample)
+            bold = bold[cut_idx:]
+            ts = (jnp.arange(bold.shape[0]) + cut_idx) * dt * num_skip * bold_decimate / 1000.0
+        else:
+            ts = jnp.arange(bold.shape[0]) * dt * num_skip * bold_decimate / 1000.0
+        
+        return bold, ts
+    
+    return jax.jit(run_sim_jp)
+
+
 def make_jp_runsim(
     csr_weights: scipy.sparse.csr_matrix,
     idelays: np.ndarray,
@@ -77,14 +312,28 @@ def make_jp_runsim(
     j_indptr = jnp.array(csr_weights.indptr)
     assert idelays.max() < horizon - 2
     idelays2 = jnp.array(horizon + np.c_[idelays, idelays - 1].T)
+    idelays2 = idelays2.astype(jnp.int32)
+    j_indices = j_indices.astype(jnp.int32)
 
     _csr_rows = np.concatenate(
         [i * np.ones(n, "i") for i, n in enumerate(np.diff(csr_weights.indptr))]
     )
+    # Verify sorting (crucial for GPU determinism)
+    assert np.all(_csr_rows[:-1] <= _csr_rows[1:]), "CSR row indices must be sorted for segment_sum"
     j_csr_rows = jnp.array(_csr_rows)
         
     def cfun(buffer, t):
         wxij = j_weights.reshape(-1, 1) * buffer[j_indices, (t - idelays2) & horizonm1]
+            
+        # # reshape to merge (2, edges, items) → (edges, items) per delay
+        # w0 = wxij[0]
+        # w1 = wxij[1]
+        # # segment_sum is deterministic when indices are sorted (CSR format guarantees this)
+        # cx0 = segment_sum(w0, j_csr_rows, num_segments=num_out_node)
+        # cx1 = segment_sum(w1, j_csr_rows, num_segments=num_out_node)
+        # cx = jnp.stack([cx0, cx1], axis=0)
+        # return cx
+    
         cx = jnp.zeros((2, num_out_node, num_item))
         cx = cx.at[:, j_csr_rows].add(wxij)
         return cx
@@ -127,8 +376,11 @@ def make_jp_runsim(
         z = z.at[1:3].set(noise)
         z = z.at[1].multiply(params.sigma_V)
         z = z.at[2].multiply(params.sigma_u)
-        dx1 = dfun(x, cx[0])
-        dx2 = dfun(x + dt * dx1 + z, cx[1])
+        dx1 = dfun(x, cx[0]) #!TODO
+        dx2 = dfun(x + dt * dx1 + z, cx[1]) #!TODO
+        
+        # dx1 = dfun(x, cx[0])  
+        # dx2 = dfun(x + dt * dx1 + z, jnp.zeros_like(cx[1]))
         x_new = x + dt / 2 * (dx1 + dx2) + z
 
         # Apply adhoc constraint function if provided
