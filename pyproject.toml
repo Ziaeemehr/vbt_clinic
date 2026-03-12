@@ -40,3 +40,7 @@ dev = [
 
 [tool.setuptools]
 packages = ["src"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+src = ["../dataset/*", "../dataset/**/*"]

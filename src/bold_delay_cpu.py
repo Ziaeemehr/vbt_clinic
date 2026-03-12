@@ -14,12 +14,13 @@ from tqdm import tqdm
 from copy import deepcopy
 from jax.ops import segment_sum
 import pickle
+from os.path import join
+from src.utils import format_time_duration
 
 
 def make_jp_runsim(
     csr_weights: scipy.sparse.csr_matrix,
     idelays: np.ndarray,
-    params: np.ndarray,
     horizon: int,
     rng_seed=43,
     num_svar=10,
@@ -31,15 +32,14 @@ def make_jp_runsim(
     bold_decimate=10,
 ):
     """
-    Optimized version of make_jp_runsim for num_item=1 (single simulation).
+    Create a simulation function that accepts parameters as runtime inputs.
     
-    This version removes the batch dimension entirely for cleaner code and potentially
-    better performance. All arrays are 2D (num_svar, num_node) instead of 3D.
+    This version allows parameters to be passed at runtime, enabling pmap
+    parallelization across different parameter sets.
     
     Args:
         csr_weights: Sparse connectivity matrix (CSR format)
         idelays: Delay matrix for connections
-        params: Model parameters (NamedTuple)
         horizon: Size of circular buffer for delays
         rng_seed: Random seed (not used, kept for compatibility)
         num_svar: Number of state variables
@@ -51,18 +51,8 @@ def make_jp_runsim(
         bold_decimate: Factor to decimate BOLD samples
         
     Returns:
-        jit-compiled simulation function for single simulation
+        jit-compiled simulation function that accepts (master_key, init_state, params)
     """
-    
-    # Squeeze parameters from (num_node, 1) to (num_node,) for single simulation
-    # This is necessary because the batched version uses (num_node, 1) for broadcasting
-    # with (num_node, num_item), but single simulation uses (num_node,)
-    params_squeezed = type(params)(**{
-        field: jnp.squeeze(jnp.asarray(getattr(params, field))) 
-        if hasattr(getattr(params, field), 'shape') and len(jnp.asarray(getattr(params, field)).shape) == 2
-        else getattr(params, field)
-        for field in params._fields
-    })
     
     num_out_node, num_node = csr_weights.shape
     horizonm1 = horizon - 1
@@ -102,11 +92,12 @@ def make_jp_runsim(
         cx = cx.at[:, j_csr_rows].add(wxij)
         return cx
     
-    def dfun(x, cx):
+    def dfun(x, cx, params_squeezed):
         """
         Dynamics function for single simulation.
         x shape: (num_svar, num_node)
         cx shape: (num_out_node,) = (4*num_node,) - single delay component
+        params_squeezed: Model parameters (NamedTuple)
         returns: (num_svar, num_node)
         """
         # cx has 4*num_node entries: [E_connections, I_connections, D_connections, S_connections]
@@ -123,11 +114,14 @@ def make_jp_runsim(
             params_squeezed,
         )
     
-    def heun(x, cx, step_counter, master_key):
+    def heun(x, cx, step_counter, master_key, params_squeezed):
         """
         Heun integration for single simulation.
         x shape: (num_svar, num_node)
         cx shape: (2, num_node)
+        step_counter: Integration step counter
+        master_key: PRNG key
+        params_squeezed: Model parameters (NamedTuple)
         returns: (num_svar, num_node)
         """
         step_key = jax.random.fold_in(master_key, step_counter)
@@ -141,8 +135,8 @@ def make_jp_runsim(
         z = z.at[1].multiply(params_squeezed.sigma_V)
         z = z.at[2].multiply(params_squeezed.sigma_u)
         
-        dx1 = dfun(x, cx[0])
-        dx2 = dfun(x + dt * dx1 + z, cx[1])
+        dx1 = dfun(x, cx[0], params_squeezed)
+        dx2 = dfun(x + dt * dx1 + z, cx[1], params_squeezed)
         x_new = x + dt / 2 * (dx1 + dx2) + z
         
         if adhoc is not None:
@@ -158,7 +152,7 @@ def make_jp_runsim(
         p=vb.bold_default_theta,
     )
     
-    def step_and_update_bold(state, time_idx):
+    def step_and_update_bold(state, time_idx, params_squeezed):
         """
         Inner loop for single simulation.
         All state arrays have no batch dimension.
@@ -175,7 +169,7 @@ def make_jp_runsim(
             abs_time = step_i + time_idx * num_skip
             coupling = cfun(buffer, abs_time)
             
-            neural_state = heun(neural_state, coupling, step_counter, master_key)
+            neural_state = heun(neural_state, coupling, step_counter, master_key, params_squeezed)
             
             # Store firing rate - shape: (num_node,)
             buffer = buffer.at[:, abs_time % horizon].set(neural_state[0])
@@ -191,12 +185,12 @@ def make_jp_runsim(
         state["k"] = step_counter
         return state, None
     
-    def step_and_sample_bold(state, decim_idx):
+    def step_and_sample_bold(state, decim_idx, params_squeezed):
         """Outer loop with BOLD decimation."""
         start_idx = decim_idx * bold_decimate
         
         def inner_loop_body(iter_i, state_carry):
-            state_carry, _ = step_and_update_bold(state_carry, start_idx + iter_i)
+            state_carry, _ = step_and_update_bold(state_carry, start_idx + iter_i, params_squeezed)
             return state_carry
         
         state = jax.lax.fori_loop(0, bold_decimate, inner_loop_body, state)
@@ -206,13 +200,14 @@ def make_jp_runsim(
         
         return state, bold_signal
     
-    def run_sim_jp(master_key, init_state):
+    def run_sim_jp(master_key, init_state, params):
         """
-        Run single simulation.
+        Run single simulation with parameters as input.
         
         Args:
             master_key: JAX PRNG key
             init_state: Initial state array, shape (num_svar,) or (num_svar, 1)
+            params: Model parameters (NamedTuple) - already squeezed
         
         Returns:
             bold: BOLD signal, shape (num_time_points, num_node)
@@ -236,7 +231,11 @@ def make_jp_runsim(
         num_decimated_samples = num_bold_samples // bold_decimate
         decimated_indices = jnp.r_[:num_decimated_samples]
         
-        _, bold = jax.lax.scan(step_and_sample_bold, init, decimated_indices)
+        # Use scan with params passed through
+        def scan_fn(state, decim_idx):
+            return step_and_sample_bold(state, decim_idx, params)
+        
+        _, bold = jax.lax.scan(scan_fn, init, decimated_indices)
         
         if t_cut > 0:
             dt_bold_sample = dt * num_skip * bold_decimate
@@ -251,6 +250,27 @@ def make_jp_runsim(
     return jax.jit(run_sim_jp)
 
 
+def squeeze_params(params):
+    """
+    Squeeze parameters from (num_node, 1) to (num_node,) for single simulation.
+    
+    This is necessary because the batched version uses (num_node, 1) for broadcasting
+    with (num_node, num_item), but single simulation uses (num_node,).
+    
+    Args:
+        params: Model parameters (NamedTuple)
+        
+    Returns:
+        Squeezed parameters (NamedTuple)
+    """
+    return type(params)(**{
+        field: jnp.squeeze(jnp.asarray(getattr(params, field))) 
+        if hasattr(getattr(params, field), 'shape') and len(jnp.asarray(getattr(params, field)).shape) == 2
+        else getattr(params, field)
+        for field in params._fields
+    })
+
+
 def run_sweep(
     theta_list,
     setup,
@@ -258,7 +278,7 @@ def run_sweep(
     adhoc=None,
     verbose=True,
     extract_features=False,
-    extract_bold_features=None,
+    extract_features_func=None,
     kwargs_features=None,
     output_path="outputs",
     store_bolds=False,
@@ -266,12 +286,10 @@ def run_sweep(
     n_devices=None,
 ):
     """
-    Run parameter sweep across multiple parameter sets.
+    Run parameter sweep across multiple parameter sets using pmap for parallelization.
     
-    Each parameter set in theta_list represents a different simulation with different
-    parameter values. The function processes simulations in batches across available
-    devices. Note: Parameters are baked into the JIT-compiled function, so each
-    parameter set requires a separate compilation.
+    This version uses pmap to run simulations in parallel across devices. Each device
+    processes a different parameter set simultaneously.
 
     Args:
         theta_list: List of parameter objects (NamedTuple), one per simulation.
@@ -312,19 +330,23 @@ def run_sweep(
     if adhoc is None:
         adhoc = gm.sigm_d1d2sero_stay_positive
 
-    # Create the single-simulation function (no pmap yet)
-    run_sim_jp = make_jp_runsim(
+    # Create the simulation function (now accepts params as runtime input!)
+    run_sim = make_jp_runsim(
         csr_weights=setup["Seids"],
         idelays=setup["idelays"],
-        params=theta_list[0],  # Use first theta as template for compilation
         horizon=setup["horizon"],
         num_svar=setup.get("num_svar", 10),
         dt=setup["dt"],
         num_skip=setup["num_skip"],
         num_time=setup["num_time"],
         bold_decimate=setup.get("bold_decimate", 10),
+        t_cut=setup.get("t_cut", 0.0),
         adhoc=adhoc,
     )
+    
+    # Create pmapped version
+    # out_axes=(0, None): BOLD is mapped across devices, ts is not (it's the same for all)
+    run_pmap = jax.pmap(run_sim, in_axes=(0, 0, 0), out_axes=(0, None))
     
     # Determine number of devices
     if n_devices is None:
@@ -333,7 +355,7 @@ def run_sweep(
         n_devices = min(n_devices, jax.local_device_count())
     
     if verbose:
-        print(f"Running {num_simulations} simulations using {n_devices} devices")
+        print(f"Running {num_simulations} simulations using {n_devices} devices with pmap")
         noise_mode = "identical" if same_noise else "independent"
         print(f"Noise mode: {noise_mode}")
     
@@ -352,7 +374,7 @@ def run_sweep(
     all_bolds = []
     ts = None
     
-    # Process in batches
+    # Process in batches using pmap
     for batch_idx in tqdm(range(n_batches), desc="Simulation batches", disable=not verbose):
         start_idx = batch_idx * n_devices
         end_idx = min(start_idx + n_devices, num_simulations)
@@ -361,43 +383,42 @@ def run_sweep(
         # Get parameter sets for this batch
         batch_thetas = theta_list[start_idx:end_idx]
         
-        # If batch is smaller than n_devices, pad with copies of the last theta
-        # (we'll discard the extra results later)
+        # Squeeze parameters before pmap (more efficient to do it once outside JIT)
+        batch_thetas_squeezed = [squeeze_params(theta) for theta in batch_thetas]
+        
+        # Pad batch if needed for pmap
         if batch_size < n_devices:
-            batch_thetas = batch_thetas + [batch_thetas[-1]] * (n_devices - batch_size)
+            # Pad with last theta
+            batch_thetas_padded = batch_thetas_squeezed + [batch_thetas_squeezed[-1]] * (n_devices - batch_size)
+        else:
+            batch_thetas_padded = batch_thetas_squeezed
         
         # Generate keys for this batch
         if same_noise:
             # Use the same key for all simulations (identical noise)
-            batch_keys = jnp.tile(master_key, (n_devices, 1))
+            batch_keys = jnp.broadcast_to(master_key, (n_devices, master_key.shape[0]))
         else:
             # Generate unique keys for each simulation in this batch (independent noise)
             batch_keys = jax.random.split(
                 jax.random.fold_in(master_key, batch_idx), n_devices
             )
         
-        # Run each simulation in the batch
-        # Note: Since parameters are baked into the JIT-compiled function,
-        # each parameter set requires a separate compilation
-        batch_bolds = []
-        for i, theta in enumerate(batch_thetas[:batch_size]):
-            # Compile simulation with this specific parameter set
-            run_sim_theta = make_jp_runsim(
-                csr_weights=setup["Seids"],
-                idelays=setup["idelays"],
-                params=theta,
-                horizon=setup["horizon"],
-                num_svar=setup.get("num_svar", 10),
-                dt=setup["dt"],
-                num_skip=setup["num_skip"],
-                num_time=setup["num_time"],
-                bold_decimate=setup.get("bold_decimate", 10),
-                t_cut=setup.get("t_cut", 0.0),
-                adhoc=adhoc,
-            )
-            bold, ts = run_sim_theta(batch_keys[i], init_state)
-            bold.block_until_ready()
-            batch_bolds.append(np.array(bold))
+        # Broadcast init_state for all simulations in batch
+        batch_init_states = jnp.broadcast_to(init_state, (n_devices, init_state.shape[0]))
+        
+        # Stack parameters as a pytree for pmap
+        # Convert list of NamedTuples to pytree structure that pmap can handle
+        batch_params_stacked = jax.tree_map(
+            lambda *args: jnp.stack(args),
+            *batch_thetas_padded
+        )
+        
+        # Run all simulations in parallel using pmap!
+        batch_bolds_all, ts = run_pmap(batch_keys, batch_init_states, batch_params_stacked)
+        batch_bolds_all.block_until_ready()
+        
+        # Extract only the non-padded results
+        batch_bolds = [np.array(batch_bolds_all[i]) for i in range(batch_size)]
         
         all_bolds.extend(batch_bolds)
     
@@ -410,25 +431,26 @@ def run_sweep(
     if store_bolds:
         bolds_np = np.array(bolds)
         ts_np = np.array(ts)
-        with open(output_path, "wb") as f:
+        with open(join(output_path, "bolds.pkl"), "wb") as f:
             pickle.dump({"bolds": bolds_np, "ts": ts_np, "theta_list": theta_list}, f)
+
     
     # Feature extraction
     if extract_features:
-        if extract_bold_features is None:
+        if extract_features_func is None:
             raise ValueError(
                 "extract_bold_features function must be provided when extract_features is True"
             )
         
-        feat_vmap_threshold = 50
-        feat_chunk_size = min(num_simulations, feat_vmap_threshold)
+        chunksize_threshold = 50
+        feat_chunk_size = min(num_simulations, chunksize_threshold)
         
         if verbose:
             print(f"Extracting features in chunks of size {feat_chunk_size}...")
         
-        vmapped_feat = jax.vmap(lambda b: extract_bold_features(b, **kwargs_features))
+        vmapped_feat = jax.vmap(lambda b: extract_features_func(b, **kwargs_features))
 
-        if num_simulations <= feat_vmap_threshold:
+        if num_simulations <= chunksize_threshold:
             results_array = vmapped_feat(bolds)
             if verbose:
                 print(f"Feature extraction complete. Features shape: {results_array.shape}")
@@ -448,7 +470,7 @@ def run_sweep(
             results_array = jnp.array(np.concatenate(results_chunks, axis=0))
             if verbose:
                 print(f"Feature extraction complete. Features shape: {results_array.shape}")
-        
+
         return results_array, None
     else:
         return bolds, ts

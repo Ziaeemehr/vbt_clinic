@@ -28,7 +28,7 @@ from sklearn.neighbors import KernelDensity
 from scipy.stats import gaussian_kde
 import scipy
 import torch
-import sbi.utils as utils
+import sbi.utils as sbi_utils
 from sbi.analysis import pairplot
 
 # =========================
@@ -43,6 +43,7 @@ import vbjax as vb
 from vbjax import make_sdde
 import src.gast_model as gm
 from src.inference import Inference
+
 # from vbt_trial.analysis.analyse_simulation import (
 #     compute_fcd,
 #     find_ALFF_of_roi,
@@ -82,17 +83,94 @@ except ImportError:
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
+
+def create_theta_list(theta_samples, param_labels, base_theta, nn, region_names):
+    """
+    Create theta_list from sampled parameters.
+    
+    This function is flexible and handles:
+    - Any combination of parameters in param_labels
+    - Optional Jdopa_cortex and Jdopa_subcortex parameters (automatically expanded)
+    - Automatic exponential transformation for Jdopa parameters (10^value)
+    - Dynamic parameter replacement in base_theta
+    
+    Workflow:
+    1. Sample parameter values from prior distribution (shape: num_sim x num_params)
+    2. For each sample, create a dictionary with param_labels as keys
+    3. If Jdopa_cortex/subcortex are present:
+       - Apply exponential transformation: 10^(sampled_value)
+       - Expand into full "Jdopa" array for all nodes (shape: num_nodes,)
+    4. Create an updated theta object by replacing the relevant fields in base_theta
+    5. Collect all theta objects into theta_list for run_sweep
+    
+    Args:
+        theta_samples: Array of shape (num_sim, num_params) with parameter samples
+        param_labels: List of parameter names corresponding to theta_samples columns
+        base_theta: Base parameter NamedTuple to update
+        nn: Number of nodes
+        region_names: List of region names for node identification
+        
+    Returns:
+        theta_list: List of parameter NamedTuples, one per simulation
+    """
+    theta_list = []
+    num_sim = theta_samples.shape[0]
+    
+    for i in range(num_sim):
+        # Extract parameter values for this simulation
+        param_dict = {label: float(theta_samples[i, j]) for j, label in enumerate(param_labels)}
+        
+        # Transform Jdopa parameters: sampled values are exponents, so compute 10^value
+        # This is only applied if these parameters exist in param_dict
+        if "Jdopa_cortex" in param_dict:
+            param_dict["Jdopa_cortex"] = 10 ** param_dict["Jdopa_cortex"]
+        if "Jdopa_subcortex" in param_dict:
+            param_dict["Jdopa_subcortex"] = 10 ** param_dict["Jdopa_subcortex"]
+        
+        # Expand Jdopa parameters if present
+        # expand_jdopa_params_cpu handles the case where only one or both are present
+        if "Jdopa_cortex" in param_dict or "Jdopa_subcortex" in param_dict:
+            param_dict = expand_jdopa_params_cpu(param_dict, nn, region_names)
+        
+        # Build replacement dictionary dynamically based on what's in param_dict
+        # Only update fields that are present in param_dict, keep base_theta values otherwise
+        replacement_dict = {}
+        for field in base_theta._fields:
+            if field in param_dict:
+                replacement_dict[field] = param_dict[field]
+        
+        # Create updated theta with all parameters
+        theta = base_theta._replace(**replacement_dict)
+        theta_list.append(theta)
+    
+    return theta_list
+
+
+def _block_until_ready(tree):
+    jax.tree_util.tree_map(
+        lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+        tree,
+    )
+
+
+def _time_call(fn, *args):
+    start = time.perf_counter()
+    out = fn(*args)
+    _block_until_ready(out)
+    return out, time.perf_counter() - start
+
+
 def format_time_duration(seconds, message=None, print_output=False, success=True):
     """
     Format time duration in seconds to hours:minutes:seconds format.
     Optionally print a beautiful message with the duration.
-    
+
     Args:
         seconds (float): Time duration in seconds
         message (str, optional): Custom message to display with the duration
         print_output (bool): Whether to print the message (default: False)
         success (bool): Whether this is a success message (affects styling)
-        
+
     Returns:
         str: Formatted time string (e.g., "2h 15m 30s" or "45m 23s" or "12s")
     """
@@ -102,14 +180,14 @@ def format_time_duration(seconds, message=None, print_output=False, success=True
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
-        
+
         if hours > 0:
             duration = f"{hours}h {minutes}m {secs}s"
         elif minutes > 0:
             duration = f"{minutes}m {secs}s"
         else:
             duration = f"{secs}s"
-    
+
     if print_output and message:
         if RICH_AVAILABLE:
             # Create beautiful rich output
@@ -122,23 +200,18 @@ def format_time_duration(seconds, message=None, print_output=False, success=True
                 text.append("ℹ️  ", style="bold blue")
                 border_style = "blue"
                 title = "[bold blue]ℹ️  Info"
-            
+
             text.append(message, style="bold cyan")
             text.append(" in ", style="white")
             text.append(duration, style="bold yellow")
-            
-            panel = Panel(
-                text,
-                title=title,
-                border_style=border_style,
-                padding=(0, 1)
-            )
+
+            panel = Panel(text, title=title, border_style=border_style, padding=(0, 1))
             console.print(panel)
         else:
             # Fallback to regular print with emojis
             emoji = "✅" if success else "ℹ️"
             print(f"{emoji} {message} in {duration}")
-    
+
     return duration
 
 
@@ -381,10 +454,10 @@ def analyze_graph_from_mask(mask, name="Graph"):
         - Graph type (directed/undirected)
     """
     num_nodes = mask.shape[0]
-    
+
     # Check if the graph is symmetric (undirected)
     is_symmetric = np.allclose(mask, mask.T)
-    
+
     if is_symmetric:
         # Undirected graph
         num_edges = np.sum(mask != 0) // 2  # Count each edge once
@@ -402,12 +475,14 @@ def analyze_graph_from_mask(mask, name="Graph"):
 
     if RICH_AVAILABLE:
         from rich.table import Table
-        
+
         # Create a table for the graph statistics
-        table = Table(title=f"📊 {name} Analysis", show_header=True, header_style="bold magenta")
+        table = Table(
+            title=f"📊 {name} Analysis", show_header=True, header_style="bold magenta"
+        )
         table.add_column("Property", style="cyan", width=20)
         table.add_column("Value", style="green", justify="right")
-        
+
         # Add rows
         if is_symmetric:
             graph_emoji = "🔄 "
@@ -415,17 +490,21 @@ def analyze_graph_from_mask(mask, name="Graph"):
         else:
             graph_emoji = "➡️ "
             graph_style = "bold yellow"
-        
+
         table.add_row("Graph Type", f"{graph_emoji} [bold]{graph_type}[/bold]")
         table.add_row("Number of Nodes", f"[bold white]{num_nodes}[/bold white]")
         table.add_row("Number of Edges", f"[bold white]{num_edges}[/bold white]")
-        
+
         if not is_symmetric:
-            table.add_row("Avg Out-Degree", f"[bold cyan]{avg_out_degree:.2f}[/bold cyan]")
-            table.add_row("Avg In-Degree", f"[bold cyan]{avg_in_degree:.2f}[/bold cyan]")
+            table.add_row(
+                "Avg Out-Degree", f"[bold cyan]{avg_out_degree:.2f}[/bold cyan]"
+            )
+            table.add_row(
+                "Avg In-Degree", f"[bold cyan]{avg_in_degree:.2f}[/bold cyan]"
+            )
         else:
             table.add_row("Average Degree", f"[bold cyan]{avg_degree:.2f}[/bold cyan]")
-        
+
         # Color code density
         if density < 0.1:
             density_color = "red"
@@ -436,12 +515,15 @@ def analyze_graph_from_mask(mask, name="Graph"):
         else:
             density_color = "green"
             density_desc = "(dense)"
-        
-        table.add_row("Density", f"[bold {density_color}]{density:.4f}[/bold {density_color}] {density_desc}")
-        
+
+        table.add_row(
+            "Density",
+            f"[bold {density_color}]{density:.4f}[/bold {density_color}] {density_desc}",
+        )
+
         console.print(table)
         console.print("\n")
-        
+
     else:
         # Fallback to regular print
         print(f"\n{'='*50}")
@@ -458,6 +540,7 @@ def analyze_graph_from_mask(mask, name="Graph"):
         print(f"Density: {density:.4f}")
         print(f"{'='*50}\n")
 
+
 def load_connectivity_data(data_dir="data", verbose=False):
     """
     Load and process simulation data from CSV files.
@@ -473,8 +556,12 @@ def load_connectivity_data(data_dir="data", verbose=False):
         Rd2 (np.ndarray): D2 receptor data.
         Rsero (np.ndarray): Serotonin receptor data.
     """
-    W = pd.read_csv(os.path.join(data_dir, "weights_with_sero_and_dopa.csv"), index_col=0)
-    L = pd.read_csv(os.path.join(data_dir, "lengths_with_sero_and_dopa.csv"), index_col=0)
+    W = pd.read_csv(
+        os.path.join(data_dir, "weights_with_sero_and_dopa.csv"), index_col=0
+    )
+    L = pd.read_csv(
+        os.path.join(data_dir, "lengths_with_sero_and_dopa.csv"), index_col=0
+    )
     Ce_mask = pd.read_csv(os.path.join(data_dir, "dk_sero_exc_mask.csv"), index_col=0)
     Ci_mask = pd.read_csv(os.path.join(data_dir, "dk_sero_inh_mask.csv"), index_col=0)
     Cd_mask = pd.read_csv(os.path.join(data_dir, "dk_sero_dopa_mask.csv"), index_col=0)
@@ -486,10 +573,10 @@ def load_connectivity_data(data_dir="data", verbose=False):
     region_names = W.index.tolist()
 
     # Ceids = np.vstack([Ce, Ci, Cd, Cs])
-    Ceids = np.load(join(data_dir,'Ceids.npy'))
+    Ceids = np.load(join(data_dir, "Ceids.npy"))
     Leids = np.vstack([L, L, L, L])
     Seids = scipy.sparse.csr_matrix(Ceids)
-    
+
     if verbose:
         analyze_graph_from_mask(Cs_mask.values, name="Serotonin Receptor Graph")
         analyze_graph_from_mask(Ce_mask.values, name="Excitatory Connection Graph")
@@ -506,12 +593,23 @@ def load_connectivity_data(data_dir="data", verbose=False):
     # Rd1 = Rd1.reshape(-1, 1)
     # Rd2 = Rd2.reshape(-1, 1)
     # Rsero = Rsero.reshape(-1, 1)
-    Rd1, Rd2, Rsero = np.load(join(data_dir, 'Receptors.npy'))
+    Rd1, Rd2, Rsero = np.load(join(data_dir, "Receptors.npy"))
 
     return Ceids, Leids, Seids, Rd1, Rd2, Rsero, region_names
 
 
-def plot_features_vs_params(theta_np, X, theta_obs, x_obs, param_labels, kwargs_features, output_dir, verbose=False, max_sim_plot=1000, max_obs_plot=100):
+def plot_features_vs_params(
+    theta_np,
+    X,
+    theta_obs,
+    x_obs,
+    param_labels,
+    kwargs_features,
+    output_dir,
+    verbose=False,
+    max_sim_plot=1000,
+    max_obs_plot=100,
+):
     if verbose:
         print("Plotting features vs parameters...")
 
@@ -525,7 +623,9 @@ def plot_features_vs_params(theta_np, X, theta_obs, x_obs, param_labels, kwargs_
 
     num_sim = theta_np.shape[0]
     if theta_obs_arr.shape[0] > max_obs_plot:
-        obs_indices = np.random.choice(theta_obs_arr.shape[0], max_obs_plot, replace=False)
+        obs_indices = np.random.choice(
+            theta_obs_arr.shape[0], max_obs_plot, replace=False
+        )
         theta_obs_plot = theta_obs_arr[obs_indices]
         xo_plot = xo_arr[obs_indices]
     else:
@@ -578,26 +678,95 @@ def get_subcortical_regions(atlas):
     """
     Return subcortical regions of the corresponding atlas
     """
-    if atlas == 'dk':
-        return ['L.CER', 'L.TH', 'L.CA', 'L.PU', 'L.PA', 'L.HI', 'L.AM', 'L.AC',
-                'R.TH', 'R.CA', 'R.PU', 'R.PA', 'R.HI', 'R.AM', 'R.AC', 'R.CER',
-                'L.SN', 'L.VTA', 'R.SN', 'R.VTA']
-    elif atlas == 'schaefer':
-        return ['Left-Cerebellum-Cortex', 'Left-Thalamus-Proper', 'Left-Caudate', 'Left-Putamen',
-                'Left-Pallidum', 'Left-Hippocampus', 'Left-Amygdala', 'Left-Accumbens-area',
-                'Right-Cerebellum-Cortex', 'Right-Thalamus-Proper', 'Right-Caudate',
-                'Right-Putamen', 'Right-Pallidum', 'Right-Hippocampus', 'Right-Amygdala',
-                'Right-Accumbens-area', 'Left-Nigra', 'Left-VTA', 'Right-Nigra', 'Right-VTA']
-    elif atlas == 'aal2':
-        return ['Caudate_L', 'Caudate_R', 'Putamen_L', 'Putamen_R', 'Pallidum_L', 'Pallidum_R',
-                'Thalamus_L', 'Thalamus_R', 'Amygdala_L', 'Amygdala_R',
-                'Cerebelum_Crus1_L', 'Cerebelum_Crus1_R', 'Cerebelum_Crus2_L', 'Cerebelum_Crus2_R',
-                'Cerebelum_3_L', 'Cerebelum_3_R', 'Cerebelum_4_5_L', 'Cerebelum_4_5_R',
-                'Cerebelum_6_L', 'Cerebelum_6_R', 'Cerebelum_7b_L', 'Cerebelum_7b_R',
-                'Cerebelum_8_L', 'Cerebelum_8_R', 'Cerebelum_9_L', 'Cerebelum_9_R',
-                'Cerebelum_10_L', 'Cerebelum_10_R',
-                'Vermis_1_2', 'Vermis_3', 'Vermis_4_5', 'Vermis_6', 'Vermis_7', 'Vermis_8',
-                'Vermis_9', 'Vermis_10', 'Nigra_L', 'VTA_L', 'Nigra_R', 'VTA_R']
+    if atlas == "dk":
+        return [
+            "L.CER",
+            "L.TH",
+            "L.CA",
+            "L.PU",
+            "L.PA",
+            "L.HI",
+            "L.AM",
+            "L.AC",
+            "R.TH",
+            "R.CA",
+            "R.PU",
+            "R.PA",
+            "R.HI",
+            "R.AM",
+            "R.AC",
+            "R.CER",
+            "L.SN",
+            "L.VTA",
+            "R.SN",
+            "R.VTA",
+        ]
+    elif atlas == "schaefer":
+        return [
+            "Left-Cerebellum-Cortex",
+            "Left-Thalamus-Proper",
+            "Left-Caudate",
+            "Left-Putamen",
+            "Left-Pallidum",
+            "Left-Hippocampus",
+            "Left-Amygdala",
+            "Left-Accumbens-area",
+            "Right-Cerebellum-Cortex",
+            "Right-Thalamus-Proper",
+            "Right-Caudate",
+            "Right-Putamen",
+            "Right-Pallidum",
+            "Right-Hippocampus",
+            "Right-Amygdala",
+            "Right-Accumbens-area",
+            "Left-Nigra",
+            "Left-VTA",
+            "Right-Nigra",
+            "Right-VTA",
+        ]
+    elif atlas == "aal2":
+        return [
+            "Caudate_L",
+            "Caudate_R",
+            "Putamen_L",
+            "Putamen_R",
+            "Pallidum_L",
+            "Pallidum_R",
+            "Thalamus_L",
+            "Thalamus_R",
+            "Amygdala_L",
+            "Amygdala_R",
+            "Cerebelum_Crus1_L",
+            "Cerebelum_Crus1_R",
+            "Cerebelum_Crus2_L",
+            "Cerebelum_Crus2_R",
+            "Cerebelum_3_L",
+            "Cerebelum_3_R",
+            "Cerebelum_4_5_L",
+            "Cerebelum_4_5_R",
+            "Cerebelum_6_L",
+            "Cerebelum_6_R",
+            "Cerebelum_7b_L",
+            "Cerebelum_7b_R",
+            "Cerebelum_8_L",
+            "Cerebelum_8_R",
+            "Cerebelum_9_L",
+            "Cerebelum_9_R",
+            "Cerebelum_10_L",
+            "Cerebelum_10_R",
+            "Vermis_1_2",
+            "Vermis_3",
+            "Vermis_4_5",
+            "Vermis_6",
+            "Vermis_7",
+            "Vermis_8",
+            "Vermis_9",
+            "Vermis_10",
+            "Nigra_L",
+            "VTA_L",
+            "Nigra_R",
+            "VTA_R",
+        ]
     else:
         raise ValueError(f"Atlas {atlas} not recognized")
 
@@ -606,16 +775,16 @@ def expand_jdopa_params(par_dict, num_nodes, num_sim, region_names):
     """
     Expand Jdopa_cortex and Jdopa_subcortex parameters into full Jdopa vector.
     After updating the Jdopa in par_dict, remove extra labels of Jdoba_...
-    
+
     Args:
         par_dict: Dictionary of parameters (may contain Jdopa_cortex and Jdopa_subcortex)
         num_nodes: Total number of nodes
         num_sim: Number of simulations (num_item in batch)
         region_names: region names
-    
+
     Returns:
         Updated par_dict with Jdopa as (num_nodes, num_sim) array
-        
+
     Note:
         The shape must be (num_nodes, num_sim) to match the expected format where:
         - axis 0 = num_nodes (spatial dimension - different brain regions)
@@ -623,29 +792,91 @@ def expand_jdopa_params(par_dict, num_nodes, num_sim, region_names):
         This is required because state variables have shape (num_svar, num_nodes, num_sim)
         and coupling terms have shape (num_nodes, num_sim).
     """
-    
+
     subcortical = get_subcortical_regions("dk")
     # Find indices of subcortical regions in region_names
-    subcortical_indices = [i for i, name in enumerate(region_names) if name in subcortical]
+    subcortical_indices = [
+        i for i, name in enumerate(region_names) if name in subcortical
+    ]
     ctx_indices = [i for i in range(len(region_names)) if i not in subcortical_indices]
 
-    if 'Jdopa_cortex' in par_dict and 'Jdopa_subcortex' in par_dict:
+    if "Jdopa_cortex" in par_dict and "Jdopa_subcortex" in par_dict:
         # Create full Jdopa array with shape (num_nodes, num_sim)
         Jdopa = jnp.zeros((num_nodes, num_sim))
-        
+
         # Fill cortical values: broadcast (num_sim,) to (num_ctx_nodes, num_sim)
         Jdopa = Jdopa.at[ctx_indices, :].set(
-            par_dict['Jdopa_cortex'].reshape(1, -1)  # Shape: (1, num_sim)
+            par_dict["Jdopa_cortex"].reshape(1, -1)  # Shape: (1, num_sim)
         )
-        
+
         # Fill subcortical values: broadcast (num_sim,) to (num_subcort_nodes, num_sim)
         Jdopa = Jdopa.at[subcortical_indices, :].set(
-            par_dict['Jdopa_subcortex'].reshape(1, -1)  # Shape: (1, num_sim)
+            par_dict["Jdopa_subcortex"].reshape(1, -1)  # Shape: (1, num_sim)
+        )
+
+        # Remove the separate parameters and add combined Jdopa
+        par_dict = {
+            k: v
+            for k, v in par_dict.items()
+            if k not in ["Jdopa_cortex", "Jdopa_subcortex"]
+        }
+        par_dict["Jdopa"] = Jdopa
+
+    return par_dict
+
+
+def expand_jdopa_params_cpu(par_dict, num_nodes, region_names):
+    """
+    Expand Jdopa_cortex and Jdopa_subcortex parameters into full Jdopa vector (CPU version).
+    After updating the Jdopa in par_dict, remove extra labels of Jdopa_...
+
+    Args:
+        par_dict: Dictionary of parameters (may contain Jdopa_cortex and Jdopa_subcortex)
+        num_nodes: Total number of nodes
+        region_names: region names
+
+    Returns:
+        Updated par_dict with Jdopa as (num_nodes, num_sim) array
+
+    Note:
+        The shape must be (num_nodes, num_sim) to match the expected format where:
+        - axis 0 = num_nodes (spatial dimension - different brain regions)
+        - axis 1 = num_sim (batch dimension - different parameter sets)
+        This is required because state variables have shape (num_svar, num_nodes, num_sim)
+        and coupling terms have shape (num_nodes, num_sim).
+    """
+
+    subcortical = get_subcortical_regions("dk")
+    # Find indices of subcortical regions in region_names
+    subcortical_indices = [
+        i for i, name in enumerate(region_names) if name in subcortical
+    ]
+    ctx_indices = [i for i in range(len(region_names)) if i not in subcortical_indices]
+    
+    # Convert lists to JAX arrays for indexing
+    subcortical_indices = jnp.array(subcortical_indices)
+    ctx_indices = jnp.array(ctx_indices)
+    
+    if "Jdopa_cortex" in par_dict and "Jdopa_subcortex" in par_dict:
+        # Create full Jdopa array with shape (num_nodes,)
+        Jdopa = jnp.zeros((num_nodes,))
+
+        # Fill cortical values
+        Jdopa = Jdopa.at[ctx_indices].set(
+            par_dict["Jdopa_cortex"]
+        )
+
+        # Fill subcortical values
+        Jdopa = Jdopa.at[subcortical_indices].set(
+            par_dict["Jdopa_subcortex"]
         )
         
         # Remove the separate parameters and add combined Jdopa
-        par_dict = {k: v for k, v in par_dict.items() 
-                   if k not in ['Jdopa_cortex', 'Jdopa_subcortex']}
-        par_dict['Jdopa'] = Jdopa
-    
+        par_dict = {
+            k: v
+            for k, v in par_dict.items()
+            if k not in ["Jdopa_cortex", "Jdopa_subcortex"]
+        }
+        par_dict["Jdopa"] = Jdopa
+
     return par_dict
